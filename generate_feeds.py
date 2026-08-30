@@ -310,14 +310,12 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    # Find the "Nadcházející akce" heading.
     marker = None
 
     for heading in soup.find_all(["h2", "h3"]):
-
         text = clean(heading.get_text(" ", strip=True))
 
-        if "Nadcházející akce" in text:
+        if text == "Nadcházející akce":
             marker = heading
             break
 
@@ -329,57 +327,74 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             [],
         )
 
-    # Work only inside the section following the marker.
-    section = marker.parent
+    # Work through headings after "Nadcházející akce".
+    # Stop when we reach the "Články a zprávy" section.
+    passed_marker = False
 
-    if not section:
-        return (
-            "Hotel Skalní mlýn - Nadcházející akce",
-            source,
-            [],
-        )
+    for heading in soup.find_all(["h2", "h3", "h4"]):
 
-    # Event cards usually contain a heading + link.
-    for heading in section.find_all(["h3", "h4"]):
+        if heading == marker:
+            passed_marker = True
+            continue
+
+        if not passed_marker:
+            continue
 
         title = clean(heading.get_text(" ", strip=True))
+
+        if title in {
+            "Články a zprávy",
+            "Naplánujte si svůj pobyt ve Skalním mlýně",
+        }:
+            break
 
         if not title:
             continue
 
-        link = heading.find("a", href=True)
-
-        if not link:
-            # Search nearby links.
-            link = heading.find_next("a", href=True)
-
-        if not link:
+        # Ignore section headings.
+        if title in {
+            "Akce a novinky ze Skalního mlýna",
+            "Nadcházející akce",
+        }:
             continue
 
-        href = absolute(source, link["href"])
-
-        if href == source:
-            continue
-
+        # Find an ancestor which contains both the event title
+        # and an event date.
         container = heading
+        event_text = ""
 
-        for _ in range(5):
+        for _ in range(10):
+
             if not container.parent:
                 break
 
             container = container.parent
+            candidate = clean(
+                container.get_text(" ", strip=True)
+            )
 
-            text = clean(container.get_text(" ", strip=True))
-
-            if len(text) > len(title) + 30:
+            if re.search(
+                r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
+                candidate,
+            ):
+                event_text = candidate
                 break
 
-        text = clean(container.get_text(" ", strip=True))
+        if not event_text:
+            continue
 
+        # Event date formats on the page include:
+        #
+        # 10. září
+        # 12. září
+        # 5. září
+        # 29. srpna – 19. září
+        #
+        # The page also contains the full year in the description,
+        # so prefer the first full date when available.
         date_match = re.search(
-            r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}"
-            r"(?:\s*[-–]\s*\d{1,2}\.\s*\d{1,2}\.\s*\d{4})?",
-            text,
+            r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
+            event_text,
         )
 
         published = (
@@ -388,13 +403,53 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             else None
         )
 
-        description = text.replace(title, "", 1)
+        # Try to find an event-specific link.
+        event_url = None
+
+        for link in container.find_all("a", href=True):
+
+            href = absolute(source, link["href"])
+
+            # Don't use navigation or generic hotel links.
+            if href == source:
+                continue
+
+            if "skalnimlyn.cz" in href:
+                event_url = href
+                break
+
+        # Some event cards don't have their own URL.
+        # In that case use a stable fragment of the source page.
+        if not event_url:
+            slug = re.sub(
+                r"[^a-z0-9]+",
+                "-",
+                title.lower(),
+            ).strip("-")
+
+            event_url = f"{source}#{slug}"
+
+        description = event_text
+
+        # Remove title.
+        description = description.replace(
+            title,
+            "",
+            1,
+        )
+
+        # Remove date-like fragments from the description.
+        description = re.sub(
+            r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
+            "",
+            description,
+        )
 
         add_item(
             items,
             title,
-            href,
-            description[:2000],
+            event_url,
+            description[:2500],
             published,
         )
 
@@ -466,10 +521,22 @@ def parse_svet_energie() -> tuple[str, str, list[Item]]:
 
         # Try several date formats.
         date_patterns = [
-            r"\d{1,2}\.\s*\d{1,2}\.\s*[-–]\s*"
-            r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
+        # 27. 6. – 31. 8. 2026
+        r"\d{1,2}\.\s*\d{1,2}\.\s*[-–]\s*"
+        r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
 
-            r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
+        # 4., 11., 18. a 25. září 2026
+        r"\d{1,2}\.,(?:\s*\d{1,2}\.,)*\s*"
+        r"(?:\d{1,2}\.\s*)?[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+"
+        r"\s+\d{4}",
+
+        # 12. září 2026
+        r"\d{1,2}\.\s*"
+        r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+"
+        r"\s+\d{4}",
+
+        # 12. 9. 2026
+        r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
         ]
 
         date_text = ""
