@@ -310,147 +310,226 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
+    # The events on this page are not represented by h3/h4 headings.
+    # They are regular text blocks following "Nadcházející akce".
     marker = None
 
-    for heading in soup.find_all(["h2", "h3"]):
-        text = clean(heading.get_text(" ", strip=True))
-
-        if text == "Nadcházející akce":
-            marker = heading
+    for element in soup.find_all(["h2", "h3"]):
+        if clean(element.get_text(" ", strip=True)) == "Nadcházející akce":
+            marker = element
             break
 
     if not marker:
-        print("Skalní mlýn: section 'Nadcházející akce' not found")
+        print("Skalní mlýn: 'Nadcházející akce' not found")
         return (
             "Hotel Skalní mlýn - Nadcházející akce",
             source,
             [],
         )
 
-    # Work through headings after "Nadcházející akce".
-    # Stop when we reach the "Články a zprávy" section.
-    passed_marker = False
+    # Find all text-containing elements after the marker.
+    #
+    # We identify event titles by looking for the characteristic
+    # date blocks immediately before them.
+    #
+    # Current page contains:
+    #
+    # 19
+    # 09/2026
+    # Den otevřených dveří Císařské jeskyně
+    #
+    # 12
+    # 09/2026
+    # Skrytá krása kamenů
+    #
+    # etc.
 
-    for heading in soup.find_all(["h2", "h3", "h4"]):
+    all_elements = list(soup.find_all(True))
 
-        if heading == marker:
-            passed_marker = True
+    try:
+        marker_index = all_elements.index(marker)
+    except ValueError:
+        marker_index = 0
+
+    after = all_elements[marker_index + 1:]
+
+    month_year_re = re.compile(
+        r"^\d{1,2}/\d{4}$"
+    )
+
+    day_re = re.compile(
+        r"^\d{1,2}$"
+    )
+
+    events = []
+
+    for i, element in enumerate(after):
+
+        text = clean(element.get_text(" ", strip=True))
+
+        if not text:
             continue
 
-        if not passed_marker:
+        # We need a small element containing only a day number.
+        if not day_re.fullmatch(text):
             continue
 
-        title = clean(heading.get_text(" ", strip=True))
+        # Look immediately around this element for "MM/YYYY".
+        month_year = None
 
-        if title in {
-            "Články a zprávy",
-            "Naplánujte si svůj pobyt ve Skalním mlýně",
-        }:
+        for next_element in after[i + 1:i + 8]:
+
+            next_text = clean(
+                next_element.get_text(" ", strip=True)
+            )
+
+            if month_year_re.fullmatch(next_text):
+                month_year = next_text
+                break
+
+        if not month_year:
+            continue
+
+        # Find the next meaningful short text element.
+        title = None
+        title_element = None
+
+        for next_element in after[i + 1:i + 25]:
+
+            next_text = clean(
+                next_element.get_text(" ", strip=True)
+            )
+
+            if not next_text:
+                continue
+
+            if month_year_re.fullmatch(next_text):
+                continue
+
+            # Time/location/description should not be considered
+            # a title. Event titles on this page are usually short
+            # and don't contain these characteristic phrases.
+            if re.search(
+                r"\bod\s+\d|"
+                r"\bdo\s+\d|"
+                r"\bhodin\b|"
+                r"^Skalní mlýn,|"
+                r"^Býčí skála$|"
+                r"^Ostrovský žleb,|"
+                r"^Areál u jeskyně",
+                next_text,
+                re.IGNORECASE,
+            ):
+                continue
+
+            # Ignore the section heading.
+            if next_text in {
+                "Novinky",
+                "Články a zprávy",
+                "Kalendář akcí",
+            }:
+                continue
+
+            # A description is normally much longer.
+            if len(next_text) > 180:
+                continue
+
+            title = next_text
+            title_element = next_element
             break
 
         if not title:
             continue
 
-        # Ignore section headings.
-        if title in {
-            "Akce a novinky ze Skalního mlýna",
-            "Nadcházející akce",
-        }:
+        # Avoid duplicates caused by nested HTML elements.
+        if any(event["title"] == title for event in events):
             continue
 
-        # Find an ancestor which contains both the event title
-        # and an event date.
-        container = heading
-        event_text = ""
+        # The full event date is normally repeated in the description.
+        #
+        # Example:
+        # "Dne ... proběhne ... v sobotu 19. 9. 2026 ..."
+        #
+        # Extract that date if possible.
+        container_text = ""
 
-        for _ in range(10):
+        # Find a parent containing the title and enough surrounding text.
+        parent = title_element
 
-            if not container.parent:
+        for _ in range(8):
+
+            if not parent.parent:
                 break
 
-            container = container.parent
+            parent = parent.parent
+
             candidate = clean(
-                container.get_text(" ", strip=True)
+                parent.get_text(" ", strip=True)
             )
 
-            if re.search(
-                r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
-                candidate,
-            ):
-                event_text = candidate
+            if len(candidate) > len(title) + 80:
+                container_text = candidate
                 break
 
-        if not event_text:
-            continue
+        full_date = None
 
-        # Event date formats on the page include:
-        #
-        # 10. září
-        # 12. září
-        # 5. září
-        # 29. srpna – 19. září
-        #
-        # The page also contains the full year in the description,
-        # so prefer the first full date when available.
         date_match = re.search(
-            r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
-            event_text,
+            r"\b(\d{1,2})\.\s*"
+            r"(\d{1,2})\.\s*"
+            r"(20\d{2})\b",
+            container_text,
         )
 
-        published = (
-            parse_date(date_match.group(0))
-            if date_match
-            else None
+        if date_match:
+            full_date = parse_date(
+                f"{date_match.group(1)}."
+                f"{date_match.group(2)}."
+                f"{date_match.group(3)}"
+            )
+
+        # If no full date was found, construct one from the
+        # visible day/month/year.
+        if not full_date:
+            day = int(text)
+            month, year = month_year.split("/")
+
+            full_date = parse_date(
+                f"{day}.{month}.{year}"
+            )
+
+        description = container_text
+
+        if description:
+            description = description.replace(
+                title,
+                "",
+                1,
+            )
+
+        # The page itself is the canonical source for these events.
+        # Individual event cards do not necessarily have their own URL.
+        event_url = source + "#" + re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            title.lower(),
+        ).strip("-")
+
+        events.append(
+            {
+                "title": title,
+                "url": event_url,
+                "description": description[:2500],
+                "published": full_date,
+            }
         )
 
-        # Try to find an event-specific link.
-        event_url = None
-
-        for link in container.find_all("a", href=True):
-
-            href = absolute(source, link["href"])
-
-            # Don't use navigation or generic hotel links.
-            if href == source:
-                continue
-
-            if "skalnimlyn.cz" in href:
-                event_url = href
-                break
-
-        # Some event cards don't have their own URL.
-        # In that case use a stable fragment of the source page.
-        if not event_url:
-            slug = re.sub(
-                r"[^a-z0-9]+",
-                "-",
-                title.lower(),
-            ).strip("-")
-
-            event_url = f"{source}#{slug}"
-
-        description = event_text
-
-        # Remove title.
-        description = description.replace(
-            title,
-            "",
-            1,
-        )
-
-        # Remove date-like fragments from the description.
-        description = re.sub(
-            r"\b\d{1,2}\.\s*\d{1,2}\.\s*\d{4}\b",
-            "",
-            description,
-        )
-
+    for event in events:
         add_item(
             items,
-            title,
-            event_url,
-            description[:2500],
-            published,
+            event["title"],
+            event["url"],
+            event["description"],
+            event["published"],
         )
 
     print(f"Skalní mlýn: found {len(items)} items")
