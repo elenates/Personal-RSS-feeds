@@ -334,7 +334,24 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    # The event section starts with "Nadcházející akce".
+    # На странице Webflow события идут последовательно:
+    #
+    #   day
+    #   month/year
+    #   title
+    #   time
+    #   location
+    #   description
+    #
+    # Например:
+    #
+    #   19
+    #   09/2026
+    #   Den otevřených dveří Císařské jeskyně
+    #   10. září, od 9:00 do 16:00 hodin
+    #   Ostrovský žleb...
+    #   Přijďte objevovat...
+
     heading = None
 
     for h in soup.find_all(["h2", "h3"]):
@@ -350,93 +367,136 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             [],
         )
 
-    # In the current Webflow page each event is represented by:
-    #
-    #   day
-    #   month/year
-    #   title
-    #   time
-    #   location
-    #   description
-    #
-    # We find the date markers and then take the following meaningful
-    # text as the title.
+    # Все элементы после "Nadcházející akce" до "Novinky".
+    nodes = []
+    node = heading
 
-    date_pattern = re.compile(
-        r"^\d{1,2}/20\d{2}$"
-    )
+    while True:
+        node = node.find_next()
 
-    current = heading
-
-    while current:
-
-        current = current.find_next()
-
-        if not current:
+        if not node:
             break
 
-        text = clean(
-            current.get_text(" ", strip=True)
-        )
+        text = clean(node.get_text(" ", strip=True))
 
-        # Stop when we reach the "Novinky" section.
         if text == "Novinky":
             break
 
-        if not date_pattern.fullmatch(text):
+        nodes.append(node)
+
+    month_pattern = re.compile(r"^\d{2}/\d{4}$")
+    day_pattern = re.compile(r"^\d{1,2}$")
+
+    for index, node in enumerate(nodes):
+
+        month_year = clean(
+            node.get_text(" ", strip=True)
+        )
+
+        if not month_pattern.fullmatch(month_year):
             continue
 
-        month_year = text
+        # Ищем непосредственно предыдущий элемент с номером дня.
+        day = None
 
-        # The previous element contains the day number.
-        previous = current.find_previous()
-
-        day = clean(
-            previous.get_text(" ", strip=True)
-        ) if previous else ""
-
-        if not re.fullmatch(r"\d{1,2}", day):
-            continue
-
-        # The title is the next reasonably short text element.
-        title = ""
-        title_node = None
-
-        node = current.find_next()
-
-        for _ in range(15):
-
-            if not node:
-                break
-
-            candidate = clean(
-                node.get_text(" ", strip=True)
+        for previous in reversed(nodes[:index]):
+            previous_text = clean(
+                previous.get_text(" ", strip=True)
             )
 
-            if (
-                candidate
-                and candidate != month_year
-                and not re.fullmatch(
-                    r"\d{1,2}",
-                    candidate
-                )
-                and not re.fullmatch(
-                    r"\d{1,2}:\d{2}",
-                    candidate
-                )
-                and len(candidate) <= 150
-            ):
-                title = candidate
-                title_node = node
+            if day_pattern.fullmatch(previous_text):
+                day = previous_text
                 break
 
-            node = node.find_next()
+            # Не уходим слишком далеко назад.
+            break
 
-        if not title:
+        if not day:
             continue
 
-        if any(item.title == title for item in items):
+        # После MM/YYYY находятся:
+        # title
+        # time
+        # location
+        # description
+        #
+        # Берём следующие несколько уникальных текстовых узлов.
+
+        candidates = []
+
+        for following in nodes[index + 1:]:
+
+            text = clean(
+                following.get_text(" ", strip=True)
+            )
+
+            if not text:
+                continue
+
+            # Следующее событие.
+            if month_pattern.fullmatch(text):
+                break
+
+            if day_pattern.fullmatch(text):
+                continue
+
+            if text in candidates:
+                continue
+
+            candidates.append(text)
+
+            if len(candidates) >= 5:
+                break
+
+        if not candidates:
             continue
+
+        title = candidates[0]
+
+        # Отбрасываем очевидные не-названия.
+        if title in {
+            "Kultura",
+            "Sport",
+            "Společenské",
+            "Akce",
+        }:
+            if len(candidates) > 1:
+                title = candidates[1]
+
+        # У нас обычно:
+        # candidates[0] = title
+        # candidates[1] = time
+        # candidates[2] = location
+        # candidates[3+] = description
+
+        time_text = (
+            candidates[1]
+            if len(candidates) > 1
+            else ""
+        )
+
+        location = (
+            candidates[2]
+            if len(candidates) > 2
+            else ""
+        )
+
+        description_parts = []
+
+        if time_text:
+            description_parts.append(time_text)
+
+        if location:
+            description_parts.append(location)
+
+        if len(candidates) > 3:
+            description_parts.extend(
+                candidates[3:]
+            )
+
+        description = clean(
+            " ".join(description_parts)
+        )
 
         month, year = month_year.split("/")
 
@@ -444,44 +504,31 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             f"{day}.{month}.{year}"
         )
 
-        # Find the surrounding event card.
-        container = title_node
-        description = ""
-
-        for _ in range(10):
-
-            if not container:
-                break
-
-            candidate = clean(
-                container.get_text(" ", strip=True)
-            )
-
-            if (
-                len(candidate) > len(title) + 80
-                and len(candidate) < 5000
-            ):
-                description = candidate
-                break
-
-            container = container.parent
-
-        if title in description:
-            description = description.replace(
-                title,
-                "",
-                1,
-            )
-
-        description = clean(description)
+        # У событий нет отдельных страниц.
+        # Поэтому используем исходную страницу.
+        event_url = source
 
         add_item(
             items,
             title,
-            source,
-            description[:2500],
+            event_url,
+            description[:3000],
             published,
         )
+
+    # Удаляем возможные дубликаты по названию.
+    unique = []
+    seen = set()
+
+    for item in items:
+
+        if item.title in seen:
+            continue
+
+        seen.add(item.title)
+        unique.append(item)
+
+    items = unique
 
     print(f"Skalní mlýn: found {len(items)} items")
 
