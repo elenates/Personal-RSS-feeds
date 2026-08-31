@@ -56,11 +56,9 @@ def parse_date(text: str) -> datetime | None:
     if not text:
         return None
 
-    text = clean(text)
-
     try:
         result = date_parser.parse(
-            text,
+            clean(text),
             dayfirst=True,
             fuzzy=True,
         )
@@ -119,72 +117,90 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
+    # MZV article URLs have the following structure:
+    #
+    # /informace_pro_cizince/aktuality/article_name.html
+    #
+    # We deliberately reject:
+    # - index.html
+    # - .mobi
+    # - index$....mobi
+    # - javascript links
+    # - navigation/search links
+
+    article_pattern = re.compile(
+        r"/informace_pro_cizince/aktuality/"
+        r"[^/?#]+\.html$",
+        re.IGNORECASE,
+    )
+
     for link in soup.find_all("a", href=True):
-    href = absolute(source, link["href"])
-    title = clean(link.get_text(" ", strip=True))
 
-    if title and (
-        "/informace_pro_cizince/aktuality/" in href
-        or ".mobi" in href
-        or "index" in href
-    ):
-        print("MZV LINK:", repr(title), "=>", href)
+        href = absolute(source, link["href"]).split("#")[0]
 
-    # Only links to actual articles in the Aktuality directory.
-    # This deliberately excludes navigation, search and parent pages.
-    for link in soup.find_all("a", href=True):
-
-        href = absolute(source, link["href"])
-
-        if "/informace_pro_cizince/aktuality/" not in href:
+        if not article_pattern.search(href):
             continue
 
-        if href.rstrip("/").endswith("/aktuality"):
-            continue
-
-        if href.endswith("/aktuality/index.html"):
+        if href.endswith("/index.html"):
             continue
 
         title = clean(link.get_text(" ", strip=True))
 
+        # Navigation links can occasionally have a valid-looking URL.
+        # Reject obviously non-article labels.
         if not title:
             continue
 
-        # Find the nearest reasonably-sized container.
-        container = link
+        if title.lower() in {
+            "přejít na obsah",
+            "přejít na menu",
+            "hledat",
+            "rozšířené vyhledávání",
+            "mobilní verze",
+            "english",
+            "česky",
+        }:
+            continue
 
-        for _ in range(6):
-            if not container.parent:
+        # Fetch the actual article page. This gives us the canonical
+        # title, date and description instead of text from the listing.
+        try:
+            article = fetch(href)
+        except requests.RequestException:
+            continue
+
+        # Prefer the main page heading.
+        article_title = ""
+
+        for heading in article.find_all(["h1", "h2"]):
+            candidate = clean(
+                heading.get_text(" ", strip=True)
+            )
+
+            if candidate:
+                article_title = candidate
                 break
 
-            container = container.parent
-            text = clean(container.get_text(" ", strip=True))
+        if not article_title:
+            article_title = title
 
-            if len(text) >= len(title) + 20:
-                break
+        # Find date information on the article page.
+        article_text = clean(
+            article.get_text(" ", strip=True)
+        )
 
-        text = clean(container.get_text(" ", strip=True))
-
-        # MZV typically has:
-        #
-        # 16.07.2026 / 12:40 |
-        # Aktualizováno: 21.07.2026 / 13:17
-        #
-        # We want the UPDATED date.
         updated_match = re.search(
             r"Aktualizováno:\s*"
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
-            r"\s*/\s*"
-            r"(\d{1,2}:\d{2})",
-            text,
+            r"\s*/\s*(\d{1,2}:\d{2})",
+            article_text,
             re.IGNORECASE,
         )
 
         published_match = re.search(
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
-            r"\s*/\s*"
-            r"(\d{1,2}:\d{2})",
-            text,
+            r"\s*/\s*(\d{1,2}:\d{2})",
+            article_text,
         )
 
         if updated_match:
@@ -202,38 +218,51 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
         published = parse_date(date_text)
 
-        # Remove title and metadata from description.
-        description = text
+        # Try to get the main article content.
+        description = ""
 
-        description = description.replace(title, "", 1)
-
-        description = re.sub(
-            r"\d{1,2}\.\d{1,2}\.\d{4}\s*/\s*\d{1,2}:\d{2}",
-            "",
-            description,
+        # MZV pages commonly use content/article containers.
+        candidates = article.select(
+            "#content, .content, #page_content, "
+            ".article, .article-content"
         )
 
+        if candidates:
+            # Use the longest meaningful candidate.
+            description = max(
+                (
+                    clean(node.get_text(" ", strip=True))
+                    for node in candidates
+                ),
+                key=len,
+                default="",
+            )
+
+        if not description:
+            description = article_text
+
+        # Remove obvious navigation/header/footer text.
         description = re.sub(
-            r"Aktualizováno:\s*"
-            r"\d{1,2}\.\d{1,2}\.\d{4}"
-            r"\s*/\s*\d{1,2}:\d{2}",
+            r"^.*?Přejít na menu",
             "",
             description,
             flags=re.IGNORECASE,
         )
 
         description = re.sub(
-            r"více\s*►",
+            r"©.*$",
             "",
             description,
             flags=re.IGNORECASE,
         )
+
+        description = clean(description)
 
         add_item(
             items,
-            title,
+            article_title,
             href,
-            description[:2000],
+            description[:3000],
             published,
         )
 
@@ -268,7 +297,6 @@ def parse_tmbk() -> tuple[str, str, list[Item]]:
         if "seznamzpravy.cz" not in href:
             continue
 
-        # Look around the article for a date.
         container = link
 
         for _ in range(5):
@@ -276,7 +304,6 @@ def parse_tmbk() -> tuple[str, str, list[Item]]:
                 break
 
             container = container.parent
-
             text = clean(container.get_text(" ", strip=True))
 
             if len(text) > len(title) + 20:
@@ -321,20 +348,10 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    print("SKALNI MLÝN LINKS:")
-
-    for link in soup.find_all("a", href=True):
-        title = clean(link.get_text(" ", strip=True))
-        href = absolute(source, link["href"])
-
-        if title:
-            print("SKALNI:", repr(title), "=>", href)
-
-    # The events on this page are not represented by h3/h4 headings.
-    # They are regular text blocks following "Nadcházející akce".
     marker = None
 
     for element in soup.find_all(["h2", "h3"]):
+
         if clean(element.get_text(" ", strip=True)) == "Nadcházející akce":
             marker = element
             break
@@ -347,175 +364,124 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             [],
         )
 
-    # Find all text-containing elements after the marker.
+    # The event cards are regular blocks, not h3/h4 elements.
     #
-    # We identify event titles by looking for the characteristic
-    # date blocks immediately before them.
-    #
-    # Current page contains:
-    #
-    # 19
-    # 09/2026
-    # Den otevřených dveří Císařské jeskyně
-    #
-    # 12
-    # 09/2026
-    # Skrytá krása kamenů
-    #
-    # etc.
+    # We locate the event titles by looking for the known event-card
+    # structure: a day number + month/year followed by the event title.
 
     all_elements = list(soup.find_all(True))
 
     try:
-        marker_index = all_elements.index(marker)
+        start_index = all_elements.index(marker)
     except ValueError:
-        marker_index = 0
+        start_index = 0
 
-    after = all_elements[marker_index + 1:]
+    after = all_elements[start_index + 1:]
 
-    month_year_re = re.compile(
-        r"^\d{1,2}/\d{4}$"
-    )
-
-    day_re = re.compile(
-        r"^\d{1,2}$"
-    )
-
-    events = []
+    day_re = re.compile(r"^\d{1,2}$")
+    month_year_re = re.compile(r"^\d{1,2}/20\d{2}$")
 
     for i, element in enumerate(after):
 
-        text = clean(element.get_text(" ", strip=True))
+        day_text = clean(
+            element.get_text(" ", strip=True)
+        )
 
-        if not text:
+        if not day_re.fullmatch(day_text):
             continue
 
-        # We need a small element containing only a day number.
-        if not day_re.fullmatch(text):
-            continue
-
-        # Look immediately around this element for "MM/YYYY".
+        # Find the corresponding month/year nearby.
         month_year = None
+        month_element_index = None
 
-        for next_element in after[i + 1:i + 8]:
+        for j in range(i + 1, min(i + 10, len(after))):
 
-            next_text = clean(
-                next_element.get_text(" ", strip=True)
+            candidate = clean(
+                after[j].get_text(" ", strip=True)
             )
 
-            if month_year_re.fullmatch(next_text):
-                month_year = next_text
+            if month_year_re.fullmatch(candidate):
+                month_year = candidate
+                month_element_index = j
                 break
 
         if not month_year:
             continue
 
-        # Find the next meaningful short text element.
+        # Find the event title after the date.
         title = None
         title_element = None
 
-        for next_element in after[i + 1:i + 25]:
+        for j in range(
+            month_element_index + 1,
+            min(month_element_index + 20, len(after)),
+        ):
 
-            next_text = clean(
-                next_element.get_text(" ", strip=True)
+            candidate = clean(
+                after[j].get_text(" ", strip=True)
             )
 
-            if not next_text:
+            if not candidate:
                 continue
 
-            if month_year_re.fullmatch(next_text):
+            if month_year_re.fullmatch(candidate):
                 continue
 
-            # Time/location/description should not be considered
-            # a title. Event titles on this page are usually short
-            # and don't contain these characteristic phrases.
-            if re.search(
-                r"\bod\s+\d|"
-                r"\bdo\s+\d|"
-                r"\bhodin\b|"
-                r"^Skalní mlýn,|"
-                r"^Býčí skála$|"
-                r"^Ostrovský žleb,|"
-                r"^Areál u jeskyně",
-                next_text,
-                re.IGNORECASE,
-            ):
+            if day_re.fullmatch(candidate):
                 continue
 
-            # Ignore the section heading.
-            if next_text in {
-                "Novinky",
+            if len(candidate) > 150:
+                continue
+
+            if candidate in {
                 "Články a zprávy",
+                "Novinky",
                 "Kalendář akcí",
             }:
                 continue
 
-            # A description is normally much longer.
-            if len(next_text) > 180:
+            # Avoid times and generic locations.
+            if re.fullmatch(
+                r"\d{1,2}:\d{2}",
+                candidate,
+            ):
                 continue
 
-            title = next_text
-            title_element = next_element
+            title = candidate
+            title_element = after[j]
             break
 
-        if not title:
+        if not title or not title_element:
             continue
 
-        # Avoid duplicates caused by nested HTML elements.
-        if any(event["title"] == title for event in events):
+        if any(item.title == title for item in items):
             continue
 
-        # The full event date is normally repeated in the description.
-        #
-        # Example:
-        # "Dne ... proběhne ... v sobotu 19. 9. 2026 ..."
-        #
-        # Extract that date if possible.
+        # Find the surrounding event card.
+        container = title_element
         container_text = ""
 
-        # Find a parent containing the title and enough surrounding text.
-        parent = title_element
+        for _ in range(10):
 
-        for _ in range(8):
-
-            if not parent.parent:
+            if not container.parent:
                 break
 
-            parent = parent.parent
+            container = container.parent
 
             candidate = clean(
-                parent.get_text(" ", strip=True)
+                container.get_text(" ", strip=True)
             )
 
-            if len(candidate) > len(title) + 80:
+            if len(candidate) > len(title) + 50:
                 container_text = candidate
                 break
 
-        full_date = None
+        # Construct date from the visible date block.
+        month, year = month_year.split("/")
 
-        date_match = re.search(
-            r"\b(\d{1,2})\.\s*"
-            r"(\d{1,2})\.\s*"
-            r"(20\d{2})\b",
-            container_text,
+        published = parse_date(
+            f"{day_text}.{month}.{year}"
         )
-
-        if date_match:
-            full_date = parse_date(
-                f"{date_match.group(1)}."
-                f"{date_match.group(2)}."
-                f"{date_match.group(3)}"
-            )
-
-        # If no full date was found, construct one from the
-        # visible day/month/year.
-        if not full_date:
-            day = int(text)
-            month, year = month_year.split("/")
-
-            full_date = parse_date(
-                f"{day}.{month}.{year}"
-            )
 
         description = container_text
 
@@ -526,30 +492,31 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
                 1,
             )
 
-        # The page itself is the canonical source for these events.
-        # Individual event cards do not necessarily have their own URL.
-        event_url = source + "#" + re.sub(
-            r"[^a-z0-9]+",
-            "-",
-            title.lower(),
-        ).strip("-")
+        # Look for an actual link associated with this event.
+        event_url = None
 
-        events.append(
-            {
-                "title": title,
-                "url": event_url,
-                "description": description[:2500],
-                "published": full_date,
-            }
-        )
+        for link in container.find_all("a", href=True):
 
-    for event in events:
+            href = absolute(source, link["href"])
+
+            if href == source:
+                continue
+
+            if href.startswith(source):
+                event_url = href
+                break
+
+        # If the event has no separate page, keep the source page.
+        # Do NOT invent an anchor that may stop working later.
+        if not event_url:
+            event_url = source
+
         add_item(
             items,
-            event["title"],
-            event["url"],
-            event["description"],
-            event["published"],
+            title,
+            event_url,
+            description[:2500],
+            published,
         )
 
     print(f"Skalní mlýn: found {len(items)} items")
@@ -583,7 +550,6 @@ def parse_svet_energie() -> tuple[str, str, list[Item]]:
         if href == source:
             continue
 
-        # Find event card.
         container = link
 
         for _ in range(8):
@@ -592,20 +558,18 @@ def parse_svet_energie() -> tuple[str, str, list[Item]]:
 
             container = container.parent
 
-            text = clean(container.get_text(" ", strip=True))
+            text = clean(
+                container.get_text(" ", strip=True)
+            )
 
             if len(text) > 100:
                 break
 
-        if not container:
-            continue
-
-        text = clean(container.get_text(" ", strip=True))
-
-        # Get the first heading inside the event card.
         title = ""
 
-        for heading in container.find_all(["h2", "h3", "h4"]):
+        for heading in container.find_all(
+            ["h2", "h3", "h4"]
+        ):
 
             candidate = clean(
                 heading.get_text(" ", strip=True)
@@ -618,24 +582,11 @@ def parse_svet_energie() -> tuple[str, str, list[Item]]:
         if not title:
             continue
 
-        # Try several date formats.
         date_patterns = [
-        # 27. 6. – 31. 8. 2026
-        r"\d{1,2}\.\s*\d{1,2}\.\s*[-–]\s*"
-        r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
+            r"\d{1,2}\.\s*\d{1,2}\.\s*[-–]\s*"
+            r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
 
-        # 4., 11., 18. a 25. září 2026
-        r"\d{1,2}\.,(?:\s*\d{1,2}\.,)*\s*"
-        r"(?:\d{1,2}\.\s*)?[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+"
-        r"\s+\d{4}",
-
-        # 12. září 2026
-        r"\d{1,2}\.\s*"
-        r"[A-Za-zÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž]+"
-        r"\s+\d{4}",
-
-        # 12. 9. 2026
-        r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
+            r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}",
         ]
 
         date_text = ""
@@ -657,7 +608,11 @@ def parse_svet_energie() -> tuple[str, str, list[Item]]:
             flags=re.IGNORECASE,
         )
 
-        description = description.replace(title, "", 1)
+        description = description.replace(
+            title,
+            "",
+            1,
+        )
 
         add_item(
             items,
@@ -686,14 +641,18 @@ def write_feed(
     source: str,
     items: list[Item],
 ):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    # Newest first.
     items = sorted(
         items,
         key=lambda item: (
             item.published
-            or datetime.min.replace(tzinfo=timezone.utc)
+            or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
         ),
         reverse=True,
     )
@@ -703,23 +662,47 @@ def write_feed(
         {"version": "2.0"},
     )
 
-    channel = SubElement(rss, "channel")
+    channel = SubElement(
+        rss,
+        "channel",
+    )
 
-    SubElement(channel, "title").text = title
-    SubElement(channel, "link").text = source
-    SubElement(channel, "description").text = (
-        "Generated personal RSS feed"
-    )
-    SubElement(channel, "generator").text = (
-        "Personal RSS Feeds"
-    )
+    SubElement(
+        channel,
+        "title",
+    ).text = title
+
+    SubElement(
+        channel,
+        "link",
+    ).text = source
+
+    SubElement(
+        channel,
+        "description",
+    ).text = "Generated personal RSS feed"
+
+    SubElement(
+        channel,
+        "generator",
+    ).text = "Personal RSS Feeds"
 
     for item in items:
 
-        element = SubElement(channel, "item")
+        element = SubElement(
+            channel,
+            "item",
+        )
 
-        SubElement(element, "title").text = item.title
-        SubElement(element, "link").text = item.url
+        SubElement(
+            element,
+            "title",
+        ).text = item.title
+
+        SubElement(
+            element,
+            "link",
+        ).text = item.url
 
         SubElement(
             element,
@@ -728,16 +711,20 @@ def write_feed(
         ).text = guid(item.url)
 
         if item.description:
+
             SubElement(
                 element,
                 "description",
             ).text = item.description
 
         if item.published:
+
             SubElement(
                 element,
                 "pubDate",
-            ).text = format_datetime(item.published)
+            ).text = format_datetime(
+                item.published
+            )
 
     ElementTree(rss).write(
         path,
