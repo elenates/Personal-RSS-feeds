@@ -204,12 +204,12 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
             container = container.parent
 
-        if not best_text:
-            best_text = clean(
-                heading.parent.get_text(" ", strip=True)
-                if heading.parent
-                else ""
-            )
+            if not best_text:
+                best_text = clean(
+                    heading.parent.get_text(" ", strip=True)
+                    if heading.parent
+                    else ""
+                )
 
         # ------------------------------------------------------------------
         # Date
@@ -272,6 +272,7 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
             flags=re.IGNORECASE,
         )
 
+        description = re.sub(r"^[,\s]+", "", description)
         description = clean(description)
 
         add_item(
