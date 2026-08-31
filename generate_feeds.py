@@ -117,134 +117,97 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    article_pattern = re.compile(
-        r"/informace_pro_cizince/aktuality/"
-        r"[^/?#]+\.html$",
-        re.IGNORECASE,
-    )
+    # MZV's listing page contains the real articles as h2 > a.
+    # We deliberately use the listing page itself instead of trying
+    # to discover articles among all navigation/mobile links.
+    for heading in soup.find_all(["h2", "h3"]):
+        link = heading.find("a", href=True)
 
-    seen_urls = set()
+        if not link:
+            continue
 
-    # The MZV page contains many navigation/mobile links.
-    # We only want real article links under /aktuality/.
-    for link in soup.find_all("a", href=True):
-
+        title = clean(link.get_text(" ", strip=True))
         raw_href = link.get("href", "").strip()
 
-        if not raw_href:
+        if not title or not raw_href:
             continue
 
-        # Completely ignore mobile versions.
-        if ".mobi" in raw_href.lower():
+        # Ignore generic navigation/interface links.
+        if title.lower() in {
+            "přejít na obsah",
+            "přejít na menu",
+            "jazyk",
+            "hledat",
+        }:
             continue
 
+        # Build the absolute URL.
         href = absolute(source, raw_href)
 
-        # Remove fragments.
+        # Remove fragments and query strings.
         href = href.split("#", 1)[0]
+        href = href.split("?", 1)[0]
 
-        # Only real article pages.
-        if not article_pattern.search(href):
+        # We only want actual articles in /aktuality/.
+        if "/informace_pro_cizince/aktuality/" not in href:
             continue
 
-        # Never include the listing page itself.
+        # Article URLs are .html. This also excludes mobile pages.
+        if not href.lower().endswith(".html"):
+            continue
+
+        # Do not accidentally include the listing page itself.
         if href.rstrip("/") == source.rstrip("/"):
             continue
 
-        if href in seen_urls:
-            continue
+        # ------------------------------------------------------------------
+        # The listing page already contains the article date and summary.
+        # Find the nearest useful container around the h2/h3.
+        # ------------------------------------------------------------------
 
-        seen_urls.add(href)
+        container = heading.parent
+        best_text = ""
 
-        # The text of the link is not necessarily the article title:
-        # MZV contains navigation/mobile UI links.
-        #
-        # Therefore fetch the actual article and extract its H1.
-        try:
-            article = fetch(href)
-        except requests.RequestException:
-            continue
+        for _ in range(5):
+            if not container:
+                break
 
-        title = ""
-
-        # Prefer H1.
-        for heading in article.find_all("h1"):
-
-            candidate = clean(
-                heading.get_text(" ", strip=True)
+            text = clean(
+                container.get_text(" ", strip=True)
             )
 
-            if not candidate:
-                continue
+            # We want a reasonably sized article card, not the whole page.
+            if len(text) >= len(title) + 20:
+                best_text = text
 
-            # Ignore generic MZV interface headings.
-            if candidate.lower() in {
-                "jazyk",
-                "hledat",
-                "přejít na obsah",
-                "přejít na menu",
-                "ministerstvo zahraničních věcí České republiky",
-            }:
-                continue
+            if len(text) >= 100:
+                break
 
-            title = candidate
-            break
+            container = container.parent
 
-        # Some MZV pages can have a slightly different heading structure.
-        if not title:
+        if not best_text:
+            best_text = clean(
+                heading.parent.get_text(" ", strip=True)
+                if heading.parent
+                else ""
+            )
 
-            for heading in article.find_all(
-                ["h2", "h3"]
-            ):
-
-                candidate = clean(
-                    heading.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if not candidate:
-                    continue
-
-                if candidate.lower() in {
-                    "jazyk",
-                    "hledat",
-                    "přejít na obsah",
-                    "přejít na menu",
-                }:
-                    continue
-
-                if len(candidate) <= 200:
-                    title = candidate
-                    break
-
-        if not title:
-            continue
-
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Date
-        # ---------------------------------------------------------------
-
-        article_text = clean(
-            article.get_text(
-                " ",
-                strip=True,
-            )
-        )
+        # ------------------------------------------------------------------
 
         updated_match = re.search(
             r"Aktualizováno:\s*"
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
             r"\s*/\s*(\d{1,2}:\d{2})",
-            article_text,
+            best_text,
             re.IGNORECASE,
         )
 
         published_match = re.search(
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
             r"\s*/\s*(\d{1,2}:\d{2})",
-            article_text,
+            best_text,
         )
 
         if updated_match:
@@ -262,51 +225,29 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
         published = parse_date(date_text)
 
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Description
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
 
-        description = ""
+        description = best_text
 
-        # Try to locate the actual article content.
-        selectors = [
-            "#content",
-            ".content",
-            "#page_content",
-            ".article",
-            ".article-content",
-            "main",
-        ]
-
-        for selector in selectors:
-
-            node = article.select_one(selector)
-
-            if not node:
-                continue
-
-            candidate = clean(
-                node.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if len(candidate) > len(description):
-                description = candidate
-
-        if not description:
-            description = article_text
-
-        # Remove title from the beginning when present.
+        # Remove the title from the beginning.
         if description.startswith(title):
-            description = description[
-                len(title):
-            ].strip()
+            description = description[len(title):].strip()
 
-        # Remove obvious breadcrumb/navigation prefixes.
+        # Remove date information from the beginning.
         description = re.sub(
-            r"^MZV\s*>\s*Vstup a pobyt\s*>\s*Aktuality\s*>\s*",
+            r"^\d{1,2}\.\d{1,2}\.\d{4}\s*/\s*\d{1,2}:\d{2}"
+            r"\s*\|\s*Aktualizováno:\s*"
+            r"\d{1,2}\.\d{1,2}\.\d{4}\s*/\s*\d{1,2}:\d{2}",
+            "",
+            description,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove "více ►" if it is included in the card text.
+        description = re.sub(
+            r"\s*více\s*►\s*$",
             "",
             description,
             flags=re.IGNORECASE,
@@ -322,6 +263,19 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
             published,
         )
 
+    # Remove duplicate URLs.
+    unique_items = []
+    seen_urls = set()
+
+    for item in items:
+        if item.url in seen_urls:
+            continue
+
+        seen_urls.add(item.url)
+        unique_items.append(item)
+
+    items = unique_items
+
     print(f"MZV: found {len(items)} items")
 
     return (
@@ -329,7 +283,6 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
         source,
         items[:50],
     )
-
 
 # ---------------------------------------------------------------------------
 # TMBK / Seznam Zprávy
