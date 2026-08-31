@@ -117,17 +117,6 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    # MZV article URLs have the following structure:
-    #
-    # /informace_pro_cizince/aktuality/article_name.html
-    #
-    # We deliberately reject:
-    # - index.html
-    # - .mobi
-    # - index$....mobi
-    # - javascript links
-    # - navigation/search links
-
     article_pattern = re.compile(
         r"/informace_pro_cizince/aktuality/"
         r"[^/?#]+\.html$",
@@ -146,49 +135,53 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
         title = clean(link.get_text(" ", strip=True))
 
-        # Navigation links can occasionally have a valid-looking URL.
-        # Reject obviously non-article labels.
         if not title:
             continue
 
-        if title.lower() in {
-            "přejít na obsah",
-            "přejít na menu",
-            "hledat",
-            "rozšířené vyhledávání",
-            "mobilní verze",
-            "english",
-            "česky",
-        }:
-            continue
-
-        # Fetch the actual article page. This gives us the canonical
-        # title, date and description instead of text from the listing.
         try:
             article = fetch(href)
         except requests.RequestException:
             continue
 
-        # Prefer the main page heading.
+        # MZV has navigation headings before the actual article H1.
+        # Find the H1 that matches the article title or the page URL.
         article_title = ""
 
-        for heading in article.find_all(["h1", "h2"]):
+        for heading in article.find_all("h1"):
+
             candidate = clean(
                 heading.get_text(" ", strip=True)
             )
 
-            if candidate:
+            if not candidate:
+                continue
+
+            if candidate.lower() == title.lower():
+                article_title = candidate
+                break
+
+            # Reject obvious navigation/interface headings.
+            if candidate.lower() in {
+                "jazyk",
+                "hledat",
+                "přejít na obsah",
+                "přejít na menu",
+            }:
+                continue
+
+            # A real article H1 is normally a reasonably short title.
+            if len(candidate) < 200:
                 article_title = candidate
                 break
 
         if not article_title:
             article_title = title
 
-        # Find date information on the article page.
         article_text = clean(
             article.get_text(" ", strip=True)
         )
 
+        # Published/updated date.
         updated_match = re.search(
             r"Aktualizováno:\s*"
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
@@ -218,43 +211,36 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
         published = parse_date(date_text)
 
-        # Try to get the main article content.
+        # Main article content.
         description = ""
 
-        # MZV pages commonly use content/article containers.
-        candidates = article.select(
-            "#content, .content, #page_content, "
-            ".article, .article-content"
-        )
+        for selector in [
+            "#content",
+            ".content",
+            "#page_content",
+            ".article",
+            ".article-content",
+        ]:
 
-        if candidates:
-            # Use the longest meaningful candidate.
-            description = max(
-                (
-                    clean(node.get_text(" ", strip=True))
-                    for node in candidates
-                ),
-                key=len,
-                default="",
-            )
+            node = article.select_one(selector)
+
+            if node:
+                candidate = clean(
+                    node.get_text(" ", strip=True)
+                )
+
+                if len(candidate) > len(description):
+                    description = candidate
 
         if not description:
             description = article_text
 
-        # Remove obvious navigation/header/footer text.
-        description = re.sub(
-            r"^.*?Přejít na menu",
-            "",
-            description,
-            flags=re.IGNORECASE,
-        )
-
-        description = re.sub(
-            r"©.*$",
-            "",
-            description,
-            flags=re.IGNORECASE,
-        )
+        # Remove the breadcrumb/title/date prefix when possible.
+        if article_title in description:
+            description = description.split(
+                article_title,
+                1
+            )[1]
 
         description = clean(description)
 
@@ -348,173 +334,151 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    marker = None
+    # The event section starts with "Nadcházející akce".
+    heading = None
 
-    for element in soup.find_all(["h2", "h3"]):
-
-        if clean(element.get_text(" ", strip=True)) == "Nadcházející akce":
-            marker = element
+    for h in soup.find_all(["h2", "h3"]):
+        if clean(h.get_text(" ", strip=True)) == "Nadcházející akce":
+            heading = h
             break
 
-    if not marker:
-        print("Skalní mlýn: 'Nadcházející akce' not found")
+    if not heading:
+        print("Skalní mlýn: event section not found")
         return (
             "Hotel Skalní mlýn - Nadcházející akce",
             source,
             [],
         )
 
-    # The event cards are regular blocks, not h3/h4 elements.
+    # In the current Webflow page each event is represented by:
     #
-    # We locate the event titles by looking for the known event-card
-    # structure: a day number + month/year followed by the event title.
+    #   day
+    #   month/year
+    #   title
+    #   time
+    #   location
+    #   description
+    #
+    # We find the date markers and then take the following meaningful
+    # text as the title.
 
-    all_elements = list(soup.find_all(True))
+    date_pattern = re.compile(
+        r"^\d{1,2}/20\d{2}$"
+    )
 
-    try:
-        start_index = all_elements.index(marker)
-    except ValueError:
-        start_index = 0
+    current = heading
 
-    after = all_elements[start_index + 1:]
+    while current:
 
-    day_re = re.compile(r"^\d{1,2}$")
-    month_year_re = re.compile(r"^\d{1,2}/20\d{2}$")
+        current = current.find_next()
 
-    for i, element in enumerate(after):
-
-        day_text = clean(
-            element.get_text(" ", strip=True)
-        )
-
-        if not day_re.fullmatch(day_text):
-            continue
-
-        # Find the corresponding month/year nearby.
-        month_year = None
-        month_element_index = None
-
-        for j in range(i + 1, min(i + 10, len(after))):
-
-            candidate = clean(
-                after[j].get_text(" ", strip=True)
-            )
-
-            if month_year_re.fullmatch(candidate):
-                month_year = candidate
-                month_element_index = j
-                break
-
-        if not month_year:
-            continue
-
-        # Find the event title after the date.
-        title = None
-        title_element = None
-
-        for j in range(
-            month_element_index + 1,
-            min(month_element_index + 20, len(after)),
-        ):
-
-            candidate = clean(
-                after[j].get_text(" ", strip=True)
-            )
-
-            if not candidate:
-                continue
-
-            if month_year_re.fullmatch(candidate):
-                continue
-
-            if day_re.fullmatch(candidate):
-                continue
-
-            if len(candidate) > 150:
-                continue
-
-            if candidate in {
-                "Články a zprávy",
-                "Novinky",
-                "Kalendář akcí",
-            }:
-                continue
-
-            # Avoid times and generic locations.
-            if re.fullmatch(
-                r"\d{1,2}:\d{2}",
-                candidate,
-            ):
-                continue
-
-            title = candidate
-            title_element = after[j]
+        if not current:
             break
 
-        if not title or not title_element:
+        text = clean(
+            current.get_text(" ", strip=True)
+        )
+
+        # Stop when we reach the "Novinky" section.
+        if text == "Novinky":
+            break
+
+        if not date_pattern.fullmatch(text):
+            continue
+
+        month_year = text
+
+        # The previous element contains the day number.
+        previous = current.find_previous()
+
+        day = clean(
+            previous.get_text(" ", strip=True)
+        ) if previous else ""
+
+        if not re.fullmatch(r"\d{1,2}", day):
+            continue
+
+        # The title is the next reasonably short text element.
+        title = ""
+        title_node = None
+
+        node = current.find_next()
+
+        for _ in range(15):
+
+            if not node:
+                break
+
+            candidate = clean(
+                node.get_text(" ", strip=True)
+            )
+
+            if (
+                candidate
+                and candidate != month_year
+                and not re.fullmatch(
+                    r"\d{1,2}",
+                    candidate
+                )
+                and not re.fullmatch(
+                    r"\d{1,2}:\d{2}",
+                    candidate
+                )
+                and len(candidate) <= 150
+            ):
+                title = candidate
+                title_node = node
+                break
+
+            node = node.find_next()
+
+        if not title:
             continue
 
         if any(item.title == title for item in items):
             continue
 
+        month, year = month_year.split("/")
+
+        published = parse_date(
+            f"{day}.{month}.{year}"
+        )
+
         # Find the surrounding event card.
-        container = title_element
-        container_text = ""
+        container = title_node
+        description = ""
 
         for _ in range(10):
 
-            if not container.parent:
+            if not container:
                 break
-
-            container = container.parent
 
             candidate = clean(
                 container.get_text(" ", strip=True)
             )
 
-            if len(candidate) > len(title) + 50:
-                container_text = candidate
+            if (
+                len(candidate) > len(title) + 80
+                and len(candidate) < 5000
+            ):
+                description = candidate
                 break
 
-        # Construct date from the visible date block.
-        month, year = month_year.split("/")
+            container = container.parent
 
-        published = parse_date(
-            f"{day_text}.{month}.{year}"
-        )
-
-        description = container_text
-
-        if description:
+        if title in description:
             description = description.replace(
                 title,
                 "",
                 1,
             )
 
-        # Look for an actual link associated with this event.
-        event_url = None
-
-        for link in container.find_all("a", href=True):
-
-            href = absolute(source, link["href"])
-
-            if href == source:
-                continue
-
-            if href.startswith(source):
-                event_url = href
-                break
-
-        # If the event has no separate page, keep the source page.
-        # Do NOT invent an anchor that may stop working later.
-        if not event_url:
-            event_url = source
+        description = clean(description)
 
         add_item(
             items,
             title,
-            event_url,
+            source,
             description[:2500],
             published,
         )
