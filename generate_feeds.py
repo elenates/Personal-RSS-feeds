@@ -148,12 +148,31 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
         href = href.split("#", 1)[0]
         href = href.split("?", 1)[0]
 
-        # We only want actual articles in /aktuality/.
+        # We only want actual article pages.
+        # MZV also has pagination/navigation links such as:
+        #   index.mobi?page=4
+        #   index.html?page=4
+        #   index$2548.mobi
+        #
+        # These are not articles and must never become RSS items.
         if "/informace_pro_cizince/aktuality/" not in href:
             continue
 
-        # Article URLs are .html. This also excludes mobile pages.
         if not href.lower().endswith(".html"):
+            continue
+
+        # Never accept the listing/index page itself.
+        filename = href.rsplit("/", 1)[-1].lower()
+
+        if filename in {
+            "index.html",
+            "index.htm",
+        }:
+            continue
+
+        # Article links should have a real article slug.
+        # This also protects us from navigation pages.
+        if filename.startswith("index"):
             continue
 
         # Do not accidentally include the listing page itself.
