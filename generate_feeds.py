@@ -334,24 +334,7 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
-    # На странице Webflow события идут последовательно:
-    #
-    #   day
-    #   month/year
-    #   title
-    #   time
-    #   location
-    #   description
-    #
-    # Например:
-    #
-    #   19
-    #   09/2026
-    #   Den otevřených dveří Císařské jeskyně
-    #   10. září, od 9:00 do 16:00 hodin
-    #   Ostrovský žleb...
-    #   Přijďte objevovat...
-
+    # Find the "Nadcházející akce" heading.
     heading = None
 
     for h in soup.find_all(["h2", "h3"]):
@@ -367,8 +350,15 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             [],
         )
 
-    # Все элементы после "Nadcházející akce" до "Novinky".
-    nodes = []
+    # Get everything from "Nadcházející akce" until "Novinky".
+    #
+    # We deliberately use text with newline separators instead of
+    # walking through individual HTML elements. The page is a Webflow
+    # page where event cards contain many nested elements, and walking
+    # the DOM produces duplicate/incorrect text nodes.
+
+    lines = []
+
     node = heading
 
     while True:
@@ -382,102 +372,129 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
         if text == "Novinky":
             break
 
-        nodes.append(node)
+        # Only collect leaf-ish textual elements.
+        if not node.find_all():
+            if text:
+                lines.append(text)
 
-    month_pattern = re.compile(r"^\d{2}/\d{4}$")
-    day_pattern = re.compile(r"^\d{1,2}$")
+    # The previous method may still produce duplicates because of the
+    # Webflow structure. A more reliable source is the text of the
+    # parent section containing the heading.
 
-    for index, node in enumerate(nodes):
+    section = heading.parent
 
-        month_year = clean(
-            node.get_text(" ", strip=True)
+    while section and len(
+        clean(section.get_text(" ", strip=True))
+    ) < 500:
+        section = section.parent
+
+    if not section:
+        print("Skalní mlýn: event container not found")
+        return (
+            "Hotel Skalní mlýn - Nadcházející akce",
+            source,
+            [],
         )
 
-        if not month_pattern.fullmatch(month_year):
+    # Extract visible text using newline separators.
+    text_lines = [
+        clean(line)
+        for line in section.get_text(
+            "\n",
+            strip=True,
+        ).splitlines()
+        if clean(line)
+    ]
+
+    # Find "Nadcházející akce" in the text and discard everything
+    # before it.
+    try:
+        start = text_lines.index("Nadcházející akce") + 1
+        text_lines = text_lines[start:]
+    except ValueError:
+        pass
+
+    # Stop before "Novinky".
+    if "Novinky" in text_lines:
+        text_lines = text_lines[
+            :text_lines.index("Novinky")
+        ]
+
+    month_pattern = re.compile(
+        r"^(0?[1-9]|1[0-2])/20\d{2}$"
+    )
+
+    day_pattern = re.compile(
+        r"^\d{1,2}$"
+    )
+
+    i = 0
+
+    while i < len(text_lines) - 1:
+
+        day = text_lines[i]
+        month_year = text_lines[i + 1]
+
+        if not (
+            day_pattern.fullmatch(day)
+            and month_pattern.fullmatch(month_year)
+        ):
+            i += 1
             continue
 
-        # Ищем непосредственно предыдущий элемент с номером дня.
-        day = None
-
-        for previous in reversed(nodes[:index]):
-            previous_text = clean(
-                previous.get_text(" ", strip=True)
-            )
-
-            if day_pattern.fullmatch(previous_text):
-                day = previous_text
-                break
-
-            # Не уходим слишком далеко назад.
-            break
-
-        if not day:
-            continue
-
-        # После MM/YYYY находятся:
+        # Expected structure:
+        #
+        # day
+        # month/year
         # title
         # time
         # location
-        # description
+        # description...
         #
-        # Берём следующие несколько уникальных текстовых узлов.
+        if i + 2 >= len(text_lines):
+            break
 
-        candidates = []
+        title = text_lines[i + 2]
 
-        for following in nodes[index + 1:]:
-
-            text = clean(
-                following.get_text(" ", strip=True)
-            )
-
-            if not text:
-                continue
-
-            # Следующее событие.
-            if month_pattern.fullmatch(text):
-                break
-
-            if day_pattern.fullmatch(text):
-                continue
-
-            if text in candidates:
-                continue
-
-            candidates.append(text)
-
-            if len(candidates) >= 5:
-                break
-
-        if not candidates:
+        if not title:
+            i += 2
             continue
 
-        title = candidates[0]
+        # Collect everything until the next day/month pair.
+        event_lines = []
 
-        # Отбрасываем очевидные не-названия.
-        if title in {
-            "Kultura",
-            "Sport",
-            "Společenské",
-            "Akce",
-        }:
-            if len(candidates) > 1:
-                title = candidates[1]
+        j = i + 3
 
-        # У нас обычно:
-        # candidates[0] = title
-        # candidates[1] = time
-        # candidates[2] = location
-        # candidates[3+] = description
+        while j < len(text_lines):
 
+            if (
+                j + 1 < len(text_lines)
+                and day_pattern.fullmatch(text_lines[j])
+                and month_pattern.fullmatch(
+                    text_lines[j + 1]
+                )
+            ):
+                break
+
+            event_lines.append(text_lines[j])
+            j += 1
+
+        if not event_lines:
+            i = j
+            continue
+
+        # First line = time
+        # Second line = location
+        # Remaining lines = description.
         time_text = (
-            candidates[1]
-            if len(candidates) > 1
+            event_lines[0]
+            if len(event_lines) >= 1
             else ""
         )
 
         location = (
-            candidates[2]
-            if len(candidates) > 2
+            event_lines[1]
+            if len(event_lines) >= 2
             else ""
         )
 
@@ -489,9 +506,9 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
         if location:
             description_parts.append(location)
 
-        if len(candidates) > 3:
+        if len(event_lines) > 2:
             description_parts.extend(
-                candidates[3:]
+                event_lines[2:]
             )
 
         description = clean(
@@ -504,31 +521,29 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
             f"{day}.{month}.{year}"
         )
 
-        # У событий нет отдельных страниц.
-        # Поэтому используем исходную страницу.
-        event_url = source
-
         add_item(
             items,
             title,
-            event_url,
+            source,
             description[:3000],
             published,
         )
 
-    # Удаляем возможные дубликаты по названию.
-    unique = []
-    seen = set()
+        i = j
+
+    # Remove duplicate events.
+    unique_items = []
+    seen_titles = set()
 
     for item in items:
 
-        if item.title in seen:
+        if item.title in seen_titles:
             continue
 
-        seen.add(item.title)
-        unique.append(item)
+        seen_titles.add(item.title)
+        unique_items.append(item)
 
-    items = unique
+    items = unique_items
 
     print(f"Skalní mlýn: found {len(items)} items")
 
