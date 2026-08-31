@@ -119,6 +119,17 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
     soup = fetch(source)
     items: list[Item] = []
 
+    for link in soup.find_all("a", href=True):
+    href = absolute(source, link["href"])
+    title = clean(link.get_text(" ", strip=True))
+
+    if title and (
+        "/informace_pro_cizince/aktuality/" in href
+        or ".mobi" in href
+        or "index" in href
+    ):
+        print("MZV LINK:", repr(title), "=>", href)
+
     # Only links to actual articles in the Aktuality directory.
     # This deliberately excludes navigation, search and parent pages.
     for link in soup.find_all("a", href=True):
@@ -309,6 +320,15 @@ def parse_skalni_mlyn() -> tuple[str, str, list[Item]]:
 
     soup = fetch(source)
     items: list[Item] = []
+
+    print("SKALNI MLÝN LINKS:")
+
+    for link in soup.find_all("a", href=True):
+        title = clean(link.get_text(" ", strip=True))
+        href = absolute(source, link["href"])
+
+        if title:
+            print("SKALNI:", repr(title), "=>", href)
 
     # The events on this page are not represented by h3/h4 headings.
     # They are regular text blocks following "Nadcházející akce".
