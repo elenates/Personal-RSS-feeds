@@ -123,30 +123,51 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
         re.IGNORECASE,
     )
 
+    seen_urls = set()
+
+    # The MZV page contains many navigation/mobile links.
+    # We only want real article links under /aktuality/.
     for link in soup.find_all("a", href=True):
 
-        href = absolute(source, link["href"]).split("#")[0]
+        raw_href = link.get("href", "").strip()
 
+        if not raw_href:
+            continue
+
+        # Completely ignore mobile versions.
+        if ".mobi" in raw_href.lower():
+            continue
+
+        href = absolute(source, raw_href)
+
+        # Remove fragments.
+        href = href.split("#", 1)[0]
+
+        # Only real article pages.
         if not article_pattern.search(href):
             continue
 
-        if href.endswith("/index.html"):
+        # Never include the listing page itself.
+        if href.rstrip("/") == source.rstrip("/"):
             continue
 
-        title = clean(link.get_text(" ", strip=True))
-
-        if not title:
+        if href in seen_urls:
             continue
 
+        seen_urls.add(href)
+
+        # The text of the link is not necessarily the article title:
+        # MZV contains navigation/mobile UI links.
+        #
+        # Therefore fetch the actual article and extract its H1.
         try:
             article = fetch(href)
         except requests.RequestException:
             continue
 
-        # MZV has navigation headings before the actual article H1.
-        # Find the H1 that matches the article title or the page URL.
-        article_title = ""
+        title = ""
 
+        # Prefer H1.
         for heading in article.find_all("h1"):
 
             candidate = clean(
@@ -156,32 +177,62 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
             if not candidate:
                 continue
 
-            if candidate.lower() == title.lower():
-                article_title = candidate
-                break
-
-            # Reject obvious navigation/interface headings.
+            # Ignore generic MZV interface headings.
             if candidate.lower() in {
                 "jazyk",
                 "hledat",
                 "přejít na obsah",
                 "přejít na menu",
+                "ministerstvo zahraničních věcí České republiky",
             }:
                 continue
 
-            # A real article H1 is normally a reasonably short title.
-            if len(candidate) < 200:
-                article_title = candidate
-                break
+            title = candidate
+            break
 
-        if not article_title:
-            article_title = title
+        # Some MZV pages can have a slightly different heading structure.
+        if not title:
+
+            for heading in article.find_all(
+                ["h2", "h3"]
+            ):
+
+                candidate = clean(
+                    heading.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+
+                if not candidate:
+                    continue
+
+                if candidate.lower() in {
+                    "jazyk",
+                    "hledat",
+                    "přejít na obsah",
+                    "přejít na menu",
+                }:
+                    continue
+
+                if len(candidate) <= 200:
+                    title = candidate
+                    break
+
+        if not title:
+            continue
+
+        # ---------------------------------------------------------------
+        # Date
+        # ---------------------------------------------------------------
 
         article_text = clean(
-            article.get_text(" ", strip=True)
+            article.get_text(
+                " ",
+                strip=True,
+            )
         )
 
-        # Published/updated date.
         updated_match = re.search(
             r"Aktualizováno:\s*"
             r"(\d{1,2}\.\d{1,2}\.\d{4})"
@@ -211,44 +262,63 @@ def parse_mzv() -> tuple[str, str, list[Item]]:
 
         published = parse_date(date_text)
 
-        # Main article content.
+        # ---------------------------------------------------------------
+        # Description
+        # ---------------------------------------------------------------
+
         description = ""
 
-        for selector in [
+        # Try to locate the actual article content.
+        selectors = [
             "#content",
             ".content",
             "#page_content",
             ".article",
             ".article-content",
-        ]:
+            "main",
+        ]
+
+        for selector in selectors:
 
             node = article.select_one(selector)
 
-            if node:
-                candidate = clean(
-                    node.get_text(" ", strip=True)
-                )
+            if not node:
+                continue
 
-                if len(candidate) > len(description):
-                    description = candidate
+            candidate = clean(
+                node.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+            if len(candidate) > len(description):
+                description = candidate
 
         if not description:
             description = article_text
 
-        # Remove the breadcrumb/title/date prefix when possible.
-        if article_title in description:
-            description = description.split(
-                article_title,
-                1
-            )[1]
+        # Remove title from the beginning when present.
+        if description.startswith(title):
+            description = description[
+                len(title):
+            ].strip()
+
+        # Remove obvious breadcrumb/navigation prefixes.
+        description = re.sub(
+            r"^MZV\s*>\s*Vstup a pobyt\s*>\s*Aktuality\s*>\s*",
+            "",
+            description,
+            flags=re.IGNORECASE,
+        )
 
         description = clean(description)
 
         add_item(
             items,
-            article_title,
+            title,
             href,
-            description[:3000],
+            description[:5000],
             published,
         )
 
